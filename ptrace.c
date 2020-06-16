@@ -96,19 +96,22 @@ static struct {
 
 bool sm_attach(pid_t target)
 {
-    int status;
+    if (!sm_globals.options.no_ptrace)
+    {
+        int status;
 
-    /* attach to the target application, which should cause a SIGSTOP */
-    if (ptrace(PTRACE_ATTACH, target, NULL, NULL) == -1L) {
-        show_error("failed to attach to %d, %s\n", target, strerror(errno));
-        return false;
-    }
+        /* attach to the target application, which should cause a SIGSTOP */
+        if (ptrace(PTRACE_ATTACH, target, NULL, NULL) == -1L) {
+            show_error("failed to attach to %d, %s\n", target, strerror(errno));
+            return false;
+        }
 
-    /* wait for the SIGSTOP to take place. */
-    if (waitpid(target, &status, 0) == -1 || !WIFSTOPPED(status)) {
-        show_error("there was an error waiting for the target to stop.\n");
-        show_info("%s\n", strerror(errno));
-        return false;
+        /* wait for the SIGSTOP to take place. */
+        if (waitpid(target, &status, 0) == -1 || !WIFSTOPPED(status)) {
+            show_error("there was an error waiting for the target to stop.\n");
+            show_info("%s\n", strerror(errno));
+            return false;
+        }
     }
 
     /* reset the peek buffer */
@@ -124,7 +127,7 @@ bool sm_attach(pid_t target)
         snprintf(mem, sizeof(mem), "/proc/%d/mem", target);
 
         /* attempt to open the file */
-        if ((fd = open(mem, O_RDONLY)) == -1) {
+        if ((fd = open(mem, O_RDWR)) == -1) {
             show_error("unable to open %s.\n", mem);
             return false;
         }
@@ -146,9 +149,16 @@ bool sm_detach(pid_t target)
     close(peekbuf.procmem_fd);
 #endif
 
-    /* addr is ignored on Linux, but should be 1 on FreeBSD in order to let
-     * the child process continue execution where it had been interrupted */
-    return ptrace(PTRACE_DETACH, target, 1, 0) == 0;
+    if (!sm_globals.options.no_ptrace)
+    {
+        /* addr is ignored on Linux, but should be 1 on FreeBSD in order to let
+        * the child process continue execution where it had been interrupted */
+        return ptrace(PTRACE_DETACH, target, 1, 0) == 0;
+    }
+    else
+    {
+        return true;
+    }
 }
 
 
@@ -483,7 +493,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     matches_and_old_values_swath *writing_swath_index;
     int required_extra_bytes_to_record = 0;
     unsigned long total_size = 0;
-    unsigned regnum = 0;
+    unsigned long regnum = 0;
     element_t *n = vars->regions->head;
     region_t *r;
     unsigned long total_scan_bytes = 0;
@@ -568,7 +578,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
         }
 
         /* print a progress meter so user knows we haven't crashed */
-        show_user("%02u/%02u searching %#10lx - %#10lx", ++regnum,
+        show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
                 vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
         fflush(stderr);
 
@@ -602,6 +612,11 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
                 if (nread < read_size) {
                     /* the region ends here, update `memlength` */
                     memlength = nread;
+                    if ((nread == 0) && (reg_pos == r->start)) {
+                        /* Failed on first read, which means region not exist. */
+                        show_warn("reading region %02u failed.\n", regnum);
+                        break;
+                    }
                 }
                 /* If less than `MAX_ALLOC_SIZE` bytes remain, we have all of them
                  * in the buffer, so go all the way.
@@ -694,12 +709,25 @@ bool sm_setaddr(pid_t target, void *addr, const value_t *to)
         return false;
     }
 
-    /* TODO: may use /proc/<pid>/mem here */
-    /* Assume `sizeof(uint64_t)` is a multiple of `sizeof(long)` */
-    for (i = 0; i < sizeof(uint64_t); i += sizeof(long))
+    if (sm_globals.options.no_ptrace)
     {
-        if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long*)(memarray + i)) == -1L) {
+#if HAVE_PROCMEM
+        if (pwrite(peekbuf.procmem_fd, memarray, sizeof(uint64_t), (long)addr) == -1)
+        {
             return false;
+        }
+#else
+        return false;
+#endif
+    }
+    else
+    {
+        /* Assume `sizeof(uint64_t)` is a multiple of `sizeof(long)` */
+        for (i = 0; i < sizeof(uint64_t); i += sizeof(long))
+        {
+            if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long*)(memarray + i)) == -1L) {
+                return false;
+            }
         }
     }
 
@@ -732,49 +760,63 @@ bool sm_write_array(pid_t target, void *addr, const void *data, size_t len)
         return false;
     }
 
-    for (i = 0; i + sizeof(long) < len; i += sizeof(long))
+    if (sm_globals.options.no_ptrace)
     {
-        if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long *)(data + i)) == -1L) {
+#if HAVE_PROCMEM
+        if (pwrite(peekbuf.procmem_fd, data, len, (long)addr) == -1)
+        {
             return false;
         }
+#else
+        return false;
+#endif
     }
-
-    if (len - i > 0) /* something left (shorter than a long) */
+    else
     {
-        if (len > sizeof(long)) /* rewrite last sizeof(long) bytes of the buffer */
+        for (i = 0; i + sizeof(long) < len; i += sizeof(long))
         {
-            if (ptrace(PTRACE_POKEDATA, target, addr + len - sizeof(long), *(long *)(data + len - sizeof(long))) == -1L) {
+            if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long *)(data + i)) == -1L) {
                 return false;
             }
         }
-        else /* we have to play with bits... */
+
+        if (len - i > 0) /* something left (shorter than a long) */
         {
-            /* try all possible shifting read and write */
-            for(j = 0; j <= sizeof(long) - (len - i); ++j)
+            if (len > sizeof(long)) /* rewrite last sizeof(long) bytes of the buffer */
             {
-                errno = 0;
-                if(((peek_value = ptrace(PTRACE_PEEKDATA, target, addr - j, NULL)) == -1L) && (errno != 0))
-                {
-                    if (errno == EIO || errno == EFAULT) /* may try next shift */
-                        continue;
-                    else
-                    {
-                        show_error("%s failed.\n", __func__);
-                        return false;
-                    }
+                if (ptrace(PTRACE_POKEDATA, target, addr + len - sizeof(long), *(long *)(data + len - sizeof(long))) == -1L) {
+                    return false;
                 }
-                else /* peek success */
+            }
+            else /* we have to play with bits... */
+            {
+                /* try all possible shifting read and write */
+                for(j = 0; j <= sizeof(long) - (len - i); ++j)
                 {
-                    /* write back */
-                    memcpy(((int8_t*)&peek_value)+j, data+i, len-i);        
-
-                    if (ptrace(PTRACE_POKEDATA, target, addr - j, peek_value) == -1L)
+                    errno = 0;
+                    if(((peek_value = ptrace(PTRACE_PEEKDATA, target, addr - j, NULL)) == -1L) && (errno != 0))
                     {
-                        show_error("%s failed.\n", __func__);
-                        return false;
+                        if (errno == EIO || errno == EFAULT) /* may try next shift */
+                            continue;
+                        else
+                        {
+                            show_error("%s failed.\n", __func__);
+                            return false;
+                        }
                     }
+                    else /* peek success */
+                    {
+                        /* write back */
+                        memcpy(((int8_t*)&peek_value)+j, data+i, len-i);
 
-                    break;
+                        if (ptrace(PTRACE_POKEDATA, target, addr - j, peek_value) == -1L)
+                        {
+                            show_error("%s failed.\n", __func__);
+                            return false;
+                        }
+
+                        break;
+                    }
                 }
             }
         }

@@ -327,8 +327,7 @@ bool handler__list(globals_t *vars, char **argv, unsigned argc)
     char *v = NULL;
     const char *bytearray_suffix = ", [bytearray]";
     const char *string_suffix = ", [string]";
-    struct winsize w;
-    FILE *pager;
+    FILE *pager = stdout;
 
     unsigned long max_to_print = 10000;
     if (argc > 1) {
@@ -355,13 +354,17 @@ bool handler__list(globals_t *vars, char **argv, unsigned argc)
     matches_and_old_values_swath *reading_swath_index = vars->matches->swaths;
     size_t reading_iterator = 0;
 
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
-        if (!vars->options.backend)
+    if (isatty(STDOUT_FILENO)) {
+        struct winsize w;
+
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
             show_warn("handler__list(): couldn't get terminal size.\n");
-        pager = get_pager(stdout);
-    } else {
-        /* check if the output fits in the terminal window */
-        pager = (w.ws_row >= MIN(max_to_print, vars->num_matches)) ? stdout : get_pager(stdout);
+            pager = get_pager(stdout);
+        } else {
+            /* check if the output fits in the terminal window */
+            if (w.ws_row <= MIN(max_to_print, vars->num_matches))
+                pager = get_pager(stdout);
+        }
     }
 
     /* list all known matches */
@@ -640,7 +643,7 @@ bool handler__dregion(globals_t *vars, char **argv, unsigned argc)
 
         /* check if a match was found */
         if (np == NULL) {
-            show_warn("no region matching %u, or already removed.\n", reg_id);
+            show_warn("no region matching %lu, or already removed.\n", reg_id);
             continue;
         }
         
@@ -1036,30 +1039,30 @@ bool handler__help(globals_t *vars, char **argv, unsigned argc)
     list_t *commands = vars->commands;
     element_t *np = NULL;
     command_t *def = NULL;
-    FILE *pager;
+    FILE *pager = NULL;
+
     assert(commands != NULL);
     assert(argc >= 1);
 
     np = commands->head;
 
-    pager = get_pager(stderr);
-
-    /* print version information for generic help */
-    if (argv[1] == NULL) {
-        vars->printversion(pager);
-        fprintf(pager, "\n");
+    if (argc > 2) {
+        show_error("too many arguments.\n");
+        goto retl;
     }
 
-    /* traverse the commands list, printing out the relevant documentation */
-    while (np) {
-        command_t *command = np->data;
+    /* generic help requested */
+    if (argc == 1) {
+        pager = get_pager(stderr);
+        vars->printversion(pager);
+        fprintf(pager, "\n");
+        while (np) {
+            command_t *command = np->data;
 
-        /* remember the default command */
-        if (command->command == NULL)
-            def = command;
+            /* remember the default command */
+            if (command->command == NULL)
+                def = command;
 
-        /* just `help` with no argument */
-        if (argv[1] == NULL) {
             /* NULL shortdoc means don't print in the help listing */
             if (command->shortdoc == NULL) {
                 np = np->next;
@@ -1067,27 +1070,35 @@ bool handler__help(globals_t *vars, char **argv, unsigned argc)
             }
 
             /* print out command name */
-            fprintf(pager, "%-*s%s\n", DOC_COLUMN, command->command ? command->command : "default", command->shortdoc);
+            fprintf(pager, "%-*s%s\n", DOC_COLUMN, command->command ? command->command : "default",
+                    command->shortdoc);
 
-            /* detailed information requested about specific command */
-        } else if (command->command
-                   && strcasecmp(argv[1], command->command) == 0) {
-            fprintf(pager, "%s\n", command->longdoc ? command-> longdoc : "missing documentation");
-            ret = true;
-            goto retl;
+            np = np->next;
+        }
+        if (def)
+            fprintf(pager, "\n%s\n", def->longdoc ? def->longdoc : "");
+    } else {
+        /* detailed information requested about specific command */
+        while (np) {
+            command_t *command = np->data;
+
+            if (command->command
+                && strcasecmp(argv[1], command->command) == 0) {
+                pager = get_pager(stderr);
+                fprintf(pager, "%s\n", command->longdoc ? command-> longdoc : "missing documentation");
+                ret = true;
+                goto retl;
+            }
+
+            np = np->next;
         }
 
-        np = np->next;
-    }
-
-    if (argc > 1) {
+        /* couldn't find requested command */
         show_error("unknown command `%s`\n", argv[1]);
         ret = false;
-    } else if (def) {
-        fprintf(pager, "\n%s\n", def->longdoc ? def->longdoc : "");
-        ret = true;
+        goto retl;
     }
-    
+
     ret = true;
 
 retl:
@@ -1176,7 +1187,7 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
 
     /* check that this is a valid match-id */
     if (!loc.swath) {
-        show_error("you specified a non-existent match `%u`.\n", id);
+        show_error("you specified a non-existent match `%lu`.\n", id);
         show_info("use \"list\" to list matches, or \"help\" for other commands.\n");
         return false;
     }
@@ -1670,6 +1681,23 @@ bool handler__option(globals_t * vars, char **argv, unsigned argc)
             show_error("bad value for endianness, see `help option`.\n");
             return false;
         }
+    }
+    else if (strcasecmp(argv[1], "noptrace") == 0)
+    {
+#if HAVE_PROCMEM
+        if (strcmp(argv[2], "0") == 0) {vars->options.no_ptrace = 0; }
+        else if (strcmp(argv[2], "1") == 0) {vars->options.no_ptrace = 1; }
+        else
+        {
+            show_error("bad value for noptrace, see `help option`.\n");
+            return false;
+        }
+#else
+        show_error("\nThe option noptrace is not supported on your system.\n"
+                   "You might need to upgrade or reconfigure your kernel"
+                   " to support reading and writing to /proc/pid/mem.\n");
+        return false;
+#endif
     }
     else
     {
